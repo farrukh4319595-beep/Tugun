@@ -15,7 +15,7 @@ when a request is ambiguous.
 |---|---|
 | 0 Preparation (accounts, consent text, legal questions) | Doc done; user is opening accounts |
 | 1 Architecture + database | **Done.** `backend/`, 82/82 tests on Postgres 16 |
-| **2 Web app (PWA)** | **Next — this repo's job** |
+| **2 Web app (PWA)** | **In progress** — step 2 (skeleton) done in `web/`; next: step 3 Telegram login |
 | 3 Attendance 2.0 (phone + geofence) | Paused by the user |
 | 4 Telegram bot · 5 server-side AI · 6 mobile · 7 audit · 8 pilot · 9 SaaS · 10 stores | Later |
 
@@ -62,8 +62,12 @@ day/night/auto modes; AI recommendation (`78_ai.js`). It talks to a document sto
 ## Stage 2 plan (web app / PWA)
 
 1. (Done) Schema installed and verified on Supabase.
-2. App skeleton: Vite + vanilla JS or a light framework (keep the legacy look; port CSS as-is),
-   `@supabase/supabase-js`, PWA manifest + service worker, deploy to Vercel or Netlify.
+2. (Done) App skeleton in `web/`: Vite, legacy modules copied to `web/src/app/` and concatenated in
+   file-name order into one ES module by the `tugun-app` plugin in `vite.config.js` (same as `build.py`);
+   CSS copied as-is; `@supabase/supabase-js` client in `src/supabase.js` (env read from `../.env.example`);
+   PWA manifest + icons + `public/sw.js`; `vercel.json` (Root Directory `web`). Until steps 3–4 the app
+   runs in sandbox mode on the demo seed (`connect()` in `10_db.js`). `npm run smoke` checks build, views,
+   kiosk, SW and offline reload. Still mentions Claude accounts in settings/AI texts — change in steps 3–5.
 3. Telegram login: bot via @BotFather (token lives only in Supabase Edge Function secrets);
    Edge Function verifies the Telegram login hash, finds/creates the auth user and returns a session.
    Invite flow: rahbar creates a one-time invite for a staff card → employee opens the bot link →
