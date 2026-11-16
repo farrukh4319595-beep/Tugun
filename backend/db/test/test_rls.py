@@ -67,9 +67,11 @@ ok, _, err = sql([
 if not ok: sys.exit(err)
 
 # a task where b2b-sales-2 is an assignee but neither owner nor creator
-ASG = val(f"""select t.id from public.tasks t join public.task_staff ts on ts.task_id = t.id
-              where ts.staff_id = '{S('b2b-sales-2')}' and t.owner_staff_id <> '{S('b2b-sales-2')}'
-                and t.created_by is distinct from '{S('b2b-sales-2')}' limit 1""")
+# a fresh open task: owner b2b-sales-1, assignee b2b-sales-2 (neither owner nor creator)
+ASG = val([f"""insert into public.tasks (org_id, title, owner_staff_id, status, progress)
+              values ('{ORG}', 'Taqdimot tayyorlash', '{S('b2b-sales-1')}', 'progress', 20) returning id"""])
+sql([f"insert into public.task_staff (task_id, staff_id, org_id) values ('{ASG}', '{S('b2b-sales-2')}', '{ORG}')",
+     f"insert into public.task_depts (task_id, dept_id, org_id) values ('{ASG}', '{D('b2b-sales')}', '{ORG}')"])
 NOT_ASG = val(f"""select t.id from public.tasks t where org_id = '{ORG}' and not exists
               (select 1 from public.task_staff ts where ts.task_id = t.id and ts.staff_id = '{S('b2b-sales-2')}')
               and t.owner_staff_id <> '{S('b2b-sales-2')}' limit 1""")
@@ -85,10 +87,10 @@ print(f"\nfixtures: assignee task {ASG[:8]}, attendance org/dept/own = {TOTAL_AT
 # ─────────── 1. who can read what ───────────
 expect("anon sees no tasks", None, "select count(*) from public.tasks", 0, role="anon")
 expect("non-member sees no tasks", NOBODY, "select count(*) from public.tasks", 0)
-expect("rahbar sees all 9 tasks of own org only", R, "select count(*) from public.tasks", 9)
+expect("rahbar sees all 10 tasks of own org only", R, "select count(*) from public.tasks", 10)
 expect("rahbar sees 27 staff", R, "select count(*) from public.staff", 27)
 expect("other org's rahbar sees none of ours", R2, f"select count(*) from public.tasks where org_id = '{ORG}'", 0)
-expect("guest sees tasks (read-only role)", GUEST, "select count(*) from public.tasks", 9)
+expect("guest sees tasks (read-only role)", GUEST, "select count(*) from public.tasks", 10)
 expect("terminal sees no tasks", TERM, "select count(*) from public.tasks", 0)
 expect("terminal sees no staff list", TERM, "select count(*) from public.staff", 0)
 expect("rahbar sees all attendance", R, "select count(*) from public.attendance", TOTAL_ATT)
@@ -130,7 +132,16 @@ expect("assignee moves progress", XOD, f"update public.tasks set progress = 70 w
 expect("assignee moves status", XOD, f"update public.tasks set status = 'review' where id = '{ASG}' returning status", "review")
 expect("status change is logged with actor", R, f"select count(*) from public.task_events where task_id = '{ASG}' and kind = 'status' and actor_staff = '{S('b2b-sales-2')}'", 1)
 expect("status change notifies mas'ul", R, f"select count(*) from public.activity a join public.tasks t on t.id = a.task_id where a.task_id = '{ASG}' and a.kind = 'status' and t.owner_staff_id = any(a.to_staff)", 1)
-expect("done sets done_at and 100%", XOD, f"update public.tasks set status = 'done' where id = '{ASG}' returning progress = 100 and done_at is not null", "t")
+deny("assignee cannot mark a task done (rahbar accepts)", XOD, f"update public.tasks set status = 'done' where id = '{ASG}'")
+deny("boshliq cannot mark a task done either", HEAD, f"update public.tasks set status = 'done' where id = '{ASG}'")
+expect("rahbar accepts: done, 100%, accepted_by stamped", R, [f"select public.task_review('{ASG}', true, null)", f"select status = 'done' and progress = 100 and done_at is not null and accepted_by = '{R}' from public.tasks where id = '{ASG}'"], "t")
+deny("assignee cannot reopen an accepted task", XOD, f"update public.tasks set status = 'progress' where id = '{ASG}'")
+deny("returning a task needs a comment", R, f"select public.task_review('{ASG}', false, '')")
+expect("rahbar returns with a comment → progress", R, f"select public.task_review('{ASG}', false, 'Hisobot to''liq emas')", "progress")
+expect("return clears acceptance and notifies the team", R, f"select (select accepted_by is null from public.tasks where id = '{ASG}') and exists (select 1 from public.activity where task_id = '{ASG}' and kind = 'returned' and '{S('b2b-sales-2')}' = any(to_staff))", "t")
+deny("non-rahbar cannot use task_review", HEAD, f"select public.task_review('{ASG}', true, null)")
+expect("assignee sends for review → rahbar notified", XOD, f"update public.tasks set status = 'review' where id = '{ASG}' returning status", "review")
+expect("review notification exists", R, f"select count(*) > 0 from public.activity where task_id = '{ASG}' and kind = 'review'", "t")
 expect("xodim cannot touch a task he is not on (0 rows)", XOD, f"with u as (update public.tasks set progress = 1 where id = '{NOT_ASG}' returning 1) select count(*) from u", 0)
 expect("boshliq cannot delete a task owned by another department (0 rows)", HEAD, f"with d as (delete from public.tasks where id = '{OTHER_DEPT_TASK}' returning 1) select count(*) from d", 0)
 deny("nobody writes task history directly", R, f"insert into public.task_events (org_id, task_id, kind) values ('{ORG}', '{NEW}', 'fake')")
@@ -184,6 +195,76 @@ total_act = val(f"select count(*) from public.activity where org_id = '{ORG}'")
 mine = val(f"select count(*) from public.activity where org_id = '{ORG}' and (actor_staff = '{S('b2b-sales-2')}' or '{S('b2b-sales-2')}' = any(to_staff))")
 expect("xodim sees only activity addressed to him", XOD, "select count(*) from public.activity", mine)
 check("…which is less than the whole feed", int(mine) < int(total_act), f"{mine} vs {total_act}")
+
+
+# ─────────── 10. foundation 003: registration ───────────
+NEWBIE, NEWBIE2 = str(uuid.uuid4()), str(uuid.uuid4())
+sql(f"insert into auth.users (id) values ('{NEWBIE}'), ('{NEWBIE2}')")
+CODE = val(f"select join_code from public.orgs where id = '{ORG}'")
+expect("newcomer sees nothing before approval", NEWBIE, "select count(*) from public.staff", 0)
+deny("wrong company code is refused", NEWBIE, "select public.request_join('XXXXXXXX', 'Vali Aliyev', '+998901234567')")
+REQ = val(f"select public.request_join('{CODE.lower()}', 'Vali Aliyev', '+998 90 123 45 67')", NEWBIE)
+check("newcomer sends a join request with the company code", bool(REQ))
+deny("second pending request is refused", NEWBIE, f"select public.request_join('{CODE}', 'Vali Aliyev')")
+expect("newcomer sees own request", NEWBIE, "select count(*) from public.join_requests", 1)
+expect("xodim does not see join requests", XOD, "select count(*) from public.join_requests", 0)
+expect("rahbar sees the request", R, f"select count(*) from public.join_requests where id = '{REQ}'", 1)
+deny("xodim cannot approve", XOD, f"select public.approve_join('{REQ}', '{S('b2c-works-2')}', 'xodim')")
+deny("cannot approve onto a card that already has an account", R, f"select public.approve_join('{REQ}', '{S('b2b-sales-2')}', 'xodim')")
+expect("rahbar approves and links a staff card", R, f"select public.approve_join('{REQ}', '{S('b2c-works-2')}', 'xodim')", "")
+expect("approved newcomer now sees the org", NEWBIE, "select count(*) from public.staff", 27)
+expect("…and only own attendance", NEWBIE, f"select count(*) = (select count(*) from public.attendance where staff_id = '{S('b2c-works-2')}') from public.attendance", "t")
+REQ2 = val(f"select public.request_join('{CODE}', 'Begona Odam')", NEWBIE2)
+expect("rahbar rejects a request", R, f"select public.reject_join('{REQ2}', 'Tanimaymiz')", "")
+expect("rejected person still sees nothing", NEWBIE2, "select count(*) from public.tasks", 0)
+deny("nobody inserts join requests directly as approved", NEWBIE2, f"insert into public.join_requests (org_id, user_id, full_name, status) values ('{ORG}', '{NEWBIE2}', 'Hiyla', 'approved')")
+
+# ─────────── 11. several departments ───────────
+expect("boshliq does not manage a b2c person yet", HEAD, f"select count(*) from public.attendance where staff_id = '{S('b2c-sales-3')}'", 0)
+deny("boshliq cannot add a second department", HEAD, f"insert into public.staff_departments (staff_id, dept_id) values ('{S('b2c-sales-3')}', '{D('b2b-sales')}')")
+expect("rahbar adds b2c person to B2B Sales as second department", R, f"insert into public.staff_departments (staff_id, dept_id, org_id) values ('{S('b2c-sales-3')}', '{D('b2b-sales')}', '{ORG}') returning 1", 1)
+expect("B2B Sales boshliq now sees that person's attendance", HEAD, f"select count(*) = (select count(*) from public.attendance where staff_id = '{S('b2c-sales-3')}') from public.attendance where staff_id = '{S('b2c-sales-3')}'", "t")
+check("…and the person actually has attendance rows", int(val(f"select count(*) from public.attendance where staff_id = '{S('b2c-sales-3')}'")) > 0)
+expect("…and may correct it", HEAD, f"select public.attendance_set('{S('b2c-sales-3')}', '2026-11-03', '09:00', '18:00', 'Ikkinchi bolimda edi')", "")
+deny("cannot attach a department of another org", R, f"insert into public.staff_departments (staff_id, dept_id, org_id) values ('{S('b2c-sales-3')}', '{D2}', '{ORG}')")
+
+# ─────────── 12. payroll foundation ───────────
+expect("rahbar sets a fixed pay plan", R, f"insert into public.pay_plans (org_id, staff_id, mode, base_amount, valid_from) values ('{ORG}', '{S('b2b-sales-2')}', 'fixed', 6000000, '2026-01-01') returning 1", 1)
+expect("rahbar sets a KPI plan for another person", R, f"insert into public.pay_plans (org_id, staff_id, mode, base_amount, params, valid_from) values ('{ORG}', '{S('b2b-sales-3')}', 'mixed', 4000000, '{{\"kpi_max\": 3000000}}', '2026-01-01') returning 1", 1)
+expect("xodim sees only own pay plan", XOD, "select count(*) from public.pay_plans", 1)
+expect("boshliq sees no pay data", HEAD, "select count(*) from public.pay_plans", 0)
+expect("guest sees no pay data", GUEST, "select count(*) from public.pay_plans", 0)
+deny("xodim cannot raise own salary", XOD, f"insert into public.pay_plans (org_id, staff_id, mode, base_amount, valid_from) values ('{ORG}', '{S('b2b-sales-2')}', 'fixed', 99000000, '2026-02-01')")
+expect("xodim cannot edit own plan (0 rows)", XOD, f"with u as (update public.pay_plans set base_amount = 1 returning 1) select count(*) from u", 0)
+expect("rahbar adds an overtime bonus", R, f"insert into public.pay_adjustments (org_id, staff_id, month, kind, amount, note) values ('{ORG}', '{S('b2b-sales-2')}', '2026-11-01', 'overtime', 250000, 'Shanba') returning 1", 1)
+
+# late fine: Nov 2026, B2B Sales starts 09:00, grace 5 min, 1000 so'm/min
+sql([f"select 1"])
+expect("late summary: arrivals beyond grace are fined per minute", R,
+       f"""select count(*) from public.late_summary('{ORG}', '2026-11-01') l
+           where l.fine = l.late_minutes * 1000 and l.late_minutes >= 0""",
+       val(f"select count(*) from public.late_summary('{ORG}', '2026-11-01')", R))
+sql([f"select set_config('x','1',false)"])
+# a controlled case
+sql([f"delete from public.attendance where staff_id = '{S('b2b-pr-2')}' and day between '2026-10-01' and '2026-10-31'",
+     f"insert into public.attendance (org_id, staff_id, day, in_time, out_time) values ('{ORG}','{S('b2b-pr-2')}','2026-10-05','09:04','18:00'),('{ORG}','{S('b2b-pr-2')}','2026-10-06','09:12','18:00'),('{ORG}','{S('b2b-pr-2')}','2026-10-07','09:30','18:00')"])
+expect("4 min late = within grace; 12 + 30 min = 42 min = 42 000 so'm", R,
+       f"select late_days || '/' || late_minutes || '/' || fine::int from public.late_summary('{ORG}', '2026-10-01') where staff_id = '{S('b2b-pr-2')}'", "2/42/42000")
+expect("rahbar records sick leave for the 30-min day", R, f"select public.absence_set('{S('b2b-pr-2')}', 'kasallik', '2026-10-07', '2026-10-07', 'Varaqa bor') is not null", "t")
+expect("absence day is not fined", R,
+       f"select late_minutes from public.late_summary('{ORG}', '2026-10-01') where staff_id = '{S('b2b-pr-2')}'", 12)
+deny("xodim cannot record own absence", XOD, f"select public.absence_set('{S('b2b-sales-2')}', 'tatil', '2026-10-10', '2026-10-12', null)")
+expect("xodim sees only own late summary", XOD, f"select count(distinct staff_id) <= 1 from public.late_summary('{ORG}', '2026-11-01')", "t")
+
+# closing a month freezes it
+deny("xodim cannot close a month", XOD, f"select public.close_month('{ORG}', '2026-10-01')")
+expect("rahbar closes October", R, f"select public.close_month('{ORG}', '2026-10-15')", "")
+deny("closed month: attendance correction refused", R, f"select public.attendance_set('{S('b2b-pr-2')}', '2026-10-06', '09:00', '18:00', 'tuzatish')")
+deny("closed month: new absence refused", R, f"select public.absence_set('{S('b2b-pr-2')}', 'tatil', '2026-10-20', '2026-11-02', null)")
+deny("closed month: adjustment refused", R, f"insert into public.pay_adjustments (org_id, staff_id, month, kind, amount) values ('{ORG}', '{S('b2b-pr-2')}', '2026-10-01', 'bonus', 100000)")
+expect("open month still works", R, f"select public.attendance_set('{S('b2b-pr-2')}', '2026-11-04', '09:00', '18:00', 'tuzatish')", "")
+expect("rahbar reopens October (logged)", R, [f"select public.reopen_month('{ORG}', '2026-10-01')", f"select count(*) from public.activity where kind = 'month_reopened'"], 1)
+expect("after reopening, correction works again", R, f"select public.attendance_set('{S('b2b-pr-2')}', '2026-10-06', '09:00', '18:00', 'tuzatish')", "")
 
 # ─────────── 9. scale: 100 staff, 3 000 tasks, 1 year of attendance ───────────
 sql([f"""insert into public.staff (org_id, dept_id, full_name)
